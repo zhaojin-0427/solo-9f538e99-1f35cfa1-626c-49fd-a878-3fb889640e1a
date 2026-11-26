@@ -78,9 +78,10 @@ check("撤下受理→撤下中", r["status"] == "revoking", r.get("status"))
 _, p = req("GET", "/api/prefetch")
 check("受理后立即停发#1许可", 1 not in [s["id"] for s in p["subtitles"]])
 check("预取告知投屏清除#1", 1 in p["revoked"])
-_, a = req("POST", "/api/subtitles/1/ack")  # 投屏清除后确认
+check("预取响应带场次代号", isinstance(p.get("generation"), int) and p["generation"] >= 1)
+_, a = req("POST", "/api/subtitles/1/ack", {"generation": p["generation"]})  # 投屏清除后确认
 check("收到确认→已撤下", a["status"] == "revoked", a.get("status"))
-_, a2 = req("POST", "/api/subtitles/1/ack")
+_, a2 = req("POST", "/api/subtitles/1/ack", {"generation": p["generation"]})
 check("晚到的重复确认幂等，不改变状态", a2["status"] == "revoked")
 
 # 5. 重连/续取：#1 永不复播
@@ -117,7 +118,7 @@ time.sleep(2)  # 投屏离线 2 秒（#3 许可仍未到期）
 _, p = req("GET", "/api/prefetch")  # 再次重连
 check("重连预取告知清除#3", 3 in p["revoked"])
 check("重连不再发放#3许可", 3 not in [s["id"] for s in p["subtitles"]])
-_, a = req("POST", "/api/subtitles/3/ack")
+_, a = req("POST", "/api/subtitles/3/ack", {"generation": p["generation"]})
 check("确认后#3→已撤下", a["status"] == "revoked", a.get("status"))
 
 # 8. 边界：首尾相接不算重叠；已撤下时段可复用
@@ -126,6 +127,67 @@ req("POST", "/api/subtitles", {"start": 2, "end": 8, "text": "A"})
 check("首尾相接不算重叠(201)", req("POST", "/api/subtitles", {"start": 8, "end": 10, "text": "B"})[0] == 201)
 req("POST", "/api/subtitles/1/revoke")
 check("已撤下时段可复用(201)", req("POST", "/api/subtitles", {"start": 3, "end": 5, "text": "C"})[0] == 201)
+req("POST", "/api/reset")
+
+# 9. 重置切场：同号字幕不串场，旧场次迟到消息全部作废
+# 9.0 重置后场次代号自增，未开播预取即清屏信号
+_, r0 = req("POST", "/api/reset")
+gen_after_reset = r0["generation"]
+check("重置返回新场次代号", gen_after_reset >= 2)
+_, p = req("GET", "/api/prefetch")
+check("重置后预取 started=false（投屏清屏等待）", p["started"] is False)
+check("重置后预取携带新场次代号", p["generation"] == gen_after_reset)
+_, st = req("GET", "/api/state")
+check("重置后导播状态无旧字幕", st["subtitles"] == [] and st["generation"] == gen_after_reset)
+
+# 9.1 新场录入同号字幕并开播
+check("新场录入#1(201)", req("POST", "/api/subtitles",
+                             {"start": 2, "end": 20, "text": "新场第一条"})[0] == 201)
+check("新场开播", req("POST", "/api/broadcast/start")[0] == 200)
+wait_elapsed(2.5)
+_, p = req("GET", "/api/prefetch")
+check("新场#1正常发放许可且带新场次",
+      any(s["id"] == 1 and s["generation"] == gen_after_reset for s in p["subtitles"]))
+
+# 9.2 新场撤下同号字幕 → 撤下中
+_, r = req("POST", "/api/subtitles/1/revoke")
+check("新场#1撤下→撤下中", r["status"] == "revoking", r.get("status"))
+
+# 9.3 旧场次迟到的确认（上一场 #1 的 ack 重置后才到）：必须被忽略
+old_gen = gen_after_reset - 1
+_, a = req("POST", "/api/subtitles/1/ack", {"generation": old_gen})
+check("旧场次迟到确认被标记 stale", a.get("stale") is True)
+check("旧场次确认不把新场#1提前翻成已撤下", sub_status(1) == "revoking")
+
+# 9.4 旧场次迟到的预取回包语义：投屏端按代号丢弃（见 screen_logic_test.js F/G）；
+#     服务端同号记录始终归属当前场次，state 中 #1 的代号就是新场次
+_, st = req("GET", "/api/state")
+sub1 = next(s for s in st["subtitles"] if s["id"] == 1)
+check("服务端同号#1归属新场次", sub1["generation"] == gen_after_reset and sub1["status"] == "revoking")
+
+# 9.5 本场确认到达 → 正常转已撤下（不被旧确认干扰过）
+_, a = req("POST", "/api/subtitles/1/ack", {"generation": gen_after_reset})
+check("本场确认→已撤下", a["status"] == "revoked" and a.get("stale") is False)
+
+# 9.6 再来一轮：撤下中只靠本场许可到期结算，旧场次确认同样不能加速
+req("POST", "/api/reset")
+_, r = req("POST", "/api/reset")  # 连按两次重置也安全，代号继续自增
+gen2 = r["generation"]
+req("POST", "/api/subtitles", {"start": 2, "end": 30, "text": "又一场第一条"})
+req("POST", "/api/broadcast/start")
+wait_elapsed(2.5)
+req("GET", "/api/prefetch")  # 发出本场许可
+_, r = req("POST", "/api/subtitles/1/revoke")
+check("又一场#1→撤下中（许可未到期）", r["status"] == "revoking", r.get("status"))
+_, a = req("POST", "/api/subtitles/1/ack", {"generation": gen2 - 1})
+check("跨多场的旧确认仍被忽略", a.get("stale") is True and sub_status(1) == "revoking")
+deadline, flipped = time.time() + 8, False
+while time.time() < deadline:
+    if sub_status(1) == "revoked":
+        flipped = True
+        break
+    time.sleep(0.3)
+check("本场许可到期后惰性→已撤下（旧确认未加速）", flipped)
 req("POST", "/api/reset")
 
 print("== " + ("全部通过" if not FAILED else f"{len(FAILED)} 项失败: {FAILED}") + " ==")

@@ -9,6 +9,8 @@
   * 撤下受理后立即停发该条许可，状态变为"撤下中"。
   * 投屏端清除该条后回确认（ack），或旧许可全部到期，才变为"已撤下"。
   * "撤下中/已撤下"字幕永不再发许可：晚到响应与重连都不能使其复播。
+  * 每次重置开启一个新场次（generation 自增）：投屏只接受当前场次的响应，
+    旧场次迟到的预取回包/确认一律按代号丢弃，同号字幕互不串场。
 
 状态保存在单进程内存中，因此必须以单 worker 运行（gunicorn --workers 1）。
 """
@@ -27,6 +29,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 state = {
+    "generation": 0,         # 场次代号：每次重置自增，旧场次的迟到消息据此丢弃
     "broadcast_start": None,   # epoch 秒；None = 未开播
     "subtitles": {},           # id -> 字幕记录
     "next_id": 1,
@@ -57,6 +60,7 @@ def _public(sub, now, elapsed):
     status = sub["status"]
     return {
         "id": sub["id"],
+        "generation": sub["generation"],
         "start": sub["start"],
         "end": sub["end"],
         "text": sub["text"],
@@ -116,6 +120,7 @@ def add_subtitle():
         state["next_id"] += 1
         state["subtitles"][sid] = {
             "id": sid,
+            "generation": state["generation"],  # 所属场次：重置后同号字幕互不影响
             "start": start,
             "end": end,
             "text": text,
@@ -135,7 +140,8 @@ def start_broadcast():
             return _err("已开播", 409)
         state["broadcast_start"] = _now()
         _log("开播")
-        return jsonify({"broadcast_start": state["broadcast_start"]})
+        return jsonify({"broadcast_start": state["broadcast_start"],
+                        "generation": state["generation"]})
 
 
 @app.post("/api/subtitles/<int:sid>/revoke")
@@ -158,30 +164,44 @@ def revoke_subtitle(sid):
 
 @app.post("/api/subtitles/<int:sid>/ack")
 def ack_subtitle(sid):
-    """投屏端清除该条后的确认。晚到的确认幂等，不改变已撤下状态。"""
+    """投屏端清除该条后的确认。
+
+    幂等规则：
+      * 同一场次内重复确认幂等，不改变已撤下状态。
+      * 携带旧场次代号的确认（重置后才迟到的上一场 ack）一律忽略，
+        绝不能把新场次同号字幕从"撤下中"提前翻成"已撤下"。
+    """
+    data = request.get_json(silent=True) or {}
+    gen = data.get("generation")
     with lock:
         now = _now()
         _sweep(now)
         sub = state["subtitles"].get(sid)
         if sub is None:
             return _err("字幕不存在", 404)
+        if gen is not None and gen != sub["generation"]:
+            _log(f"忽略字幕 #{sid} 的旧场次确认（场次 {gen} ≠ 当前 {sub['generation']}）")
+            return jsonify({"id": sid, "status": sub["status"],
+                            "generation": sub["generation"], "stale": True})
         if sub["status"] == "revoking":
             sub["status"] = "revoked"
             sub["revoked_at"] = now
             _log(f"收到字幕 #{sid} 的清除确认 → 已撤下")
-        return jsonify({"id": sid, "status": sub["status"]})
+        return jsonify({"id": sid, "status": sub["status"],
+                        "generation": sub["generation"], "stale": False})
 
 
 @app.post("/api/reset")
 def reset():
     with lock:
+        state["generation"] += 1  # 新场次：旧场次迟到的预取回包/确认全部作废
         state["broadcast_start"] = None
         state["subtitles"] = {}
         state["next_id"] = 1
         state["events"] = []
         state["last_prefetch_at"] = None
-        _log("已重置")
-        return jsonify({"ok": True})
+        _log(f"已重置（进入场次 {state['generation']}）")
+        return jsonify({"ok": True, "generation": state["generation"]})
 
 
 # ---------------- 投屏接口 ----------------
@@ -195,7 +215,9 @@ def prefetch():
         _sweep(now)
         bs = state["broadcast_start"]
         if bs is None:
-            return jsonify({"started": False, "now": now, "subtitles": [], "revoked": []})
+            return jsonify({"started": False, "now": now,
+                            "generation": state["generation"],
+                            "subtitles": [], "revoked": []})
         elapsed = now - bs
         license_expiry = now + LICENSE_TTL
         out = []
@@ -206,6 +228,7 @@ def prefetch():
                 sub["licensed_until"] = max(sub["licensed_until"], license_expiry)
                 out.append({
                     "id": sub["id"],
+                    "generation": sub["generation"],
                     "text": sub["text"],
                     "start": sub["start"],
                     "end": sub["end"],
@@ -216,6 +239,7 @@ def prefetch():
         return jsonify({
             "started": True,
             "now": now,
+            "generation": state["generation"],
             "elapsed": elapsed,
             "subtitles": out,
             "revoked": revoking,
@@ -234,6 +258,7 @@ def get_state():
         last = state["last_prefetch_at"]
         return jsonify({
             "now": now,
+            "generation": state["generation"],
             "started": bs is not None,
             "elapsed": elapsed,
             "screen_online": bool(last is not None and now - last < SCREEN_ONLINE_TTL),

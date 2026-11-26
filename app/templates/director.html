@@ -83,7 +83,8 @@
 
   function refresh() {
     fetch("/api/state").then(function (r) { return r.json(); }).then(function (st) {
-      elBcast.textContent = st.started ? ("已开播 " + st.elapsed.toFixed(1) + "s") : "未开播";
+      elBcast.textContent = (st.started ? ("已开播 " + st.elapsed.toFixed(1) + "s") : "未开播") +
+        " · 场次 " + st.generation;
       elBcast.className = "pill " + (st.started ? "green" : "gray");
       elScreen.textContent = st.screen_online ? "投屏在线" : "投屏离线";
       elScreen.className = "pill " + (st.screen_online ? "green" : "red");

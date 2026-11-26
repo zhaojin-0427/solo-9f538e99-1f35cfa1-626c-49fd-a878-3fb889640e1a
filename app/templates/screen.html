@@ -68,9 +68,13 @@
       lastFetchOk = true;
       clockOffset = resp.now - Date.now() / 1000;
       var toAck = ScreenLogic.applyPrefetch(player, resp);
-      // 清除该条后立即向服务器确认
-      toAck.forEach(function (id) {
-        fetch("/api/subtitles/" + id + "/ack", { method: "POST" }).catch(function () {});
+      // 清除该条后立即向服务器确认（携带场次代号，旧场次迟到的确认会被服务端忽略）
+      toAck.forEach(function (item) {
+        fetch("/api/subtitles/" + item.id + "/ack", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ generation: item.generation })
+        }).catch(function () {});
       });
     }).catch(function () { lastFetchOk = false; });
   }
@@ -87,6 +91,7 @@
     if (elDebug.style.display !== "none") {
       var now = serverNow();
       var lines = [
+        "场次: " + (player.generation === null ? "-" : player.generation),
         "elapsed: " + (player.broadcastStart === null ? "-" : (now - player.broadcastStart).toFixed(1) + "s"),
         "cache:"
       ];
